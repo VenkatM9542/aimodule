@@ -1,40 +1,14 @@
-import boto3
-import os
-import tarfile
-
-# AWS S3 Configuration
-aws_access_key = aws_access_key
-aws_secret_key = aws_secret_key
-s3_bucket_name = "resume-parser-ml-model"
-s3_file_path = "lambda/sagemaker_model.tar.gz"  # Specify the desired path in S3
-
-# Step 1: Prepare the required files
-requirements_txt = """
-sentence-transformers
-transformers
-scipy
-torch
-docx
-boto3
-"""
-
-# Write the requirements.txt to tmp folder
-with open("/tmp/requirements.txt", "w") as f:
-    f.write(requirements_txt)
-
-# Prepare the inference.py script
-inference_code = """
-import pandas as pd
-import torch
-from transformers import GPT2Tokenizer
-from sentence_transformers import SentenceTransformer, util
-import numpy as np
-from scipy.spatial.distance import euclidean
-from docx import Document
+import json
 import boto3
 from io import BytesIO
-import os
+from sentence_transformers import SentenceTransformer, util
+from transformers import GPT2Tokenizer
+import numpy as np
+from docx import Document
+import sys
 
+# Initialize models and S3 client
+s3 = boto3.client('s3')
 tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
 model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
 
@@ -45,7 +19,6 @@ def calculate_context_presence_score(string_a, string_b):
     tokens_a = tokenizer.tokenize(string_a)
     tokens_b = tokenizer.tokenize(string_b)
     token_presence_ratio = sum(token in tokens_b for token in tokens_a) / len(tokens_a)
-    
     embedding_a = compute_embeddings(string_a)
     embedding_b = compute_embeddings(string_b)
     cosine_scores = util.pytorch_cos_sim(embedding_a, embedding_b)
@@ -55,89 +28,68 @@ def calculate_context_presence_score(string_a, string_b):
             return min_val
         return min_val + (max_val - min_val) / (1 + np.exp(-9 * (score - 0.3)))
 
-    cosine_scores_np = cosine_scores.cpu().numpy()
-    cosine_similarity_score = cosine_scores_np[0][0]
+    cosine_similarity_score = float(cosine_scores[0][0])
     scaled_similarity_score = scale_score(cosine_similarity_score)
-    
+
     if scaled_similarity_score < 3:
         scaled_similarity_score -= (1 - token_presence_ratio)
     elif 3 <= scaled_similarity_score < 9.5:
         scaled_similarity_score += token_presence_ratio
-    
+
     scaled_similarity_score = max(min(scaled_similarity_score, 10), 0)
 
     return token_presence_ratio, cosine_similarity_score, scaled_similarity_score
 
-# Get latest resume file from S3
-def get_latest_resume_from_s3(bucket, prefix):
-    s3 = boto3.client('s3')
-    response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+def process_resume_and_job_description(resume_text, job_description):
+    token_presence_score, cosine_similarity_score, custom_model_score = calculate_context_presence_score(resume_text, job_description)
+   
+    return {
+        "Token Presence Score": float(token_presence_score),
+        "Cosine Similarity Score": float(cosine_similarity_score),
+        "Custom Model Score": float(custom_model_score)
+    }
 
-    if 'Contents' not in response:
-        raise FileNotFoundError("No resumes found in S3 under the given prefix.")
+def get_latest_docx_from_bucket(bucket_name):
+    response = s3.list_objects_v2(Bucket=bucket_name)
+    docx_files = [
+        obj for obj in response.get('Contents', [])
+        if obj['Key'].endswith('.docx')
+    ]
+   
+    if not docx_files:
+        raise Exception("No .docx files found in the bucket.")
 
-    latest_file = max(response['Contents'], key=lambda x: x['LastModified'])
-    print(f"Using resume file: {latest_file['Key']}")
-    obj = s3.get_object(Bucket=bucket, Key=latest_file['Key'])
-    return obj['Body'].read()
+    # Sort by LastModified descending to get latest one
+    latest_file = sorted(docx_files, key=lambda x: x['LastModified'], reverse=True)[0]
+    return latest_file['Key']
 
-# Extract text from .docx bytes
-def extract_text_from_docx_bytes(docx_bytes):
-    doc = Document(BytesIO(docx_bytes))
-    text = ""
-    for para in doc.paragraphs:
-        text += para.text + "\n"
-    return text
+def main(bucket, key):
+    print("Running inference for:")
+    print("Bucket:", bucket)
+    print("Key:", key)
 
-# Hardcoded job description
-job_description = "We are looking for a Data Engineer with skills in Python, PySpark, Spark, SQL, Hive, AWS Glue, Redshift, ETL."
+    response = s3.get_object(Bucket=bucket, Key=key)
+    file_stream = response['Body'].read()
+    doc = Document(BytesIO(file_stream))
+    resume_text = "\n".join([para.text for para in doc.paragraphs])
 
-# S3 configuration
-s3_bucket = 'resume-parser-ml-model'
-resume_folder = 'resume-upload-destination/'
+    job_description = "Looking for a Big data Engineer having experience in pyspark,hadoop,sql,hive,ETL,hadoop,Aws,AwsGlue,Redshift"
 
-# Read latest resume file
-resume_bytes = get_latest_resume_from_s3(s3_bucket, resume_folder)
-resume_text = extract_text_from_docx_bytes(resume_bytes)
+    result = process_resume_and_job_description(resume_text, job_description)
 
-# Calculate similarity scores
-token_presence_ratio, cosine_similarity_score, scaled_similarity_score = calculate_context_presence_score(resume_text, job_description)
+    output_key = key.replace(".docx", "_output.json")
+    s3.put_object(Bucket=bucket, Key=output_key, Body=json.dumps(result))
 
-# Print scores
-print(f"Token Presence Ratio: {token_presence_ratio}")
-print(f"Cosine Similarity Score: {cosine_similarity_score}")
-print(f"Scaled Similarity Score: {scaled_similarity_score}")
-"""
+    print("Inference result written to:", output_key)
+    print(result)
 
-# Save the inference script to /tmp/inference.py
-with open('/tmp/inference.py', 'w') as f:
-    f.write(inference_code)
 
-# Step 2: Prepare the model directory (for example, using a pre-trained model)
-from sentence_transformers import SentenceTransformer
+#bucket = 'resume-upload-destination'
+#key = 'updated_resume.docx'
 
-# Initialize your model
-model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+main(bucket, key)
 
-# Save the model
-model_dir = '/tmp/sagemaker_model/model'
-model.save(model_dir)
-
-# Step 3: Create the tar.gz file with the model, inference.py, and requirements.txt
-tar_file = '/tmp/sagemaker_model.tar.gz'
-
-with tarfile.open(tar_file, 'w:gz') as tar:
-    tar.add('/tmp/requirements.txt', arcname='requirements.txt')
-    tar.add('/tmp/inference.py', arcname='inference.py')
-    tar.add(model_dir, arcname='model')  # This will include your saved model
-
-# Step 4: Upload to S3
-s3 = boto3.client('s3', 
-                  aws_access_key_id=aws_access_key, 
-                  aws_secret_access_key=aws_secret_key)
-
-# Upload the tar.gz file to the specified S3 path
-s3.upload_file(tar_file, s3_bucket_name, s3_file_path)
-
-# Print confirmation message
-print(f'File uploaded to s3://{s3_bucket_name}/{s3_file_path}')
+bucket = 'resume-upload-destination'
+key = get_latest_docx_from_bucket(bucket)
+print("Latest uploaded file picked:", key)
+main(bucket, key)
